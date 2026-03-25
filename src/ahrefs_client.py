@@ -123,6 +123,66 @@ class AhrefsClient:
 
         return all_results
 
+    def get_organic_competitors(self, domain: str, country: str = "jp",
+                                 limit: int = 50) -> list[dict]:
+        """Get organic competitors for a domain.
+
+        Finds domains competing for the same organic keywords.
+
+        Returns: List of {"domain": str, "common_keywords": int, ...}
+        """
+        resp = self._request("GET", "site-explorer/organic-competitors", params={
+            "target": domain,
+            "country": country,
+            "limit": limit,
+            "select": "domain,common_keywords,organic_traffic,domain_rating",
+            "order_by": "common_keywords:desc",
+        })
+        return resp.get("competitors", resp.get("data", []))
+
+    def discover_competitors_for_seeds(self, seed_domains: list[str],
+                                        country: str = "jp",
+                                        per_seed_limit: int = 20,
+                                        dr_min: int = 10,
+                                        dr_max: int = 70) -> list[dict]:
+        """Discover new domains by finding organic competitors of seed domains.
+
+        Args:
+            seed_domains: Known domains to use as seeds
+            country: Target country
+            per_seed_limit: Max competitors per seed domain
+            dr_min: Minimum DR filter
+            dr_max: Maximum DR filter
+
+        Returns: Deduplicated list of discovered competitor dicts.
+        """
+        seen = set(seed_domains)
+        discovered = []
+
+        for i, seed in enumerate(seed_domains):
+            print(f"  Discovering competitors for {seed} ({i+1}/{len(seed_domains)})...")
+            try:
+                competitors = self.get_organic_competitors(
+                    seed, country=country, limit=per_seed_limit
+                )
+            except Exception as e:
+                print(f"    Skipped {seed}: {e}")
+                continue
+
+            for comp in competitors:
+                domain = comp.get("domain", "")
+                if not domain or domain in seen:
+                    continue
+
+                dr = comp.get("domain_rating", 0)
+                if dr_min <= dr <= dr_max:
+                    seen.add(domain)
+                    comp["discovered_from"] = seed
+                    discovered.append(comp)
+
+        print(f"  Discovered {len(discovered)} new domains from {len(seed_domains)} seeds")
+        return discovered
+
     def get_organic_keywords(self, domain: str, country: str = "jp",
                               limit: int = 10) -> list[dict]:
         """Get top organic keywords for a domain.

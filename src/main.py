@@ -11,7 +11,8 @@ Ahrefs API + Webスクレイピングで、SEO/AIO/LLMO提案先の
 
 出力:
 - ドメイン, 企業名, 業界, DR, オーガニックトラフィック,
-  参照ドメイン数, 電話番号, 問い合わせページ, 会社概要ページ
+  参照ドメイン数, 電話番号, 問い合わせページ, 会社概要ページ,
+  担当者名, 役職, 情報ソース
 """
 
 import argparse
@@ -27,6 +28,7 @@ from tqdm import tqdm
 
 from ahrefs_client import AhrefsClient
 from enrichment import enrich_domains_batch
+from person_finder import find_key_persons_batch
 from target_domains import (
     INDUSTRY_TARGETS,
     get_all_domains,
@@ -47,15 +49,8 @@ def get_industry_for_domain(domain: str) -> str:
 
 def run_ahrefs_analysis(client: AhrefsClient, domains: list[str],
                          dr_min: int = 10, dr_max: int = 70) -> pd.DataFrame:
-    """Run Ahrefs batch analysis and filter by DR range.
-
-    Args:
-        client: AhrefsClient instance
-        domains: List of domains to analyze
-        dr_min: Minimum DR (inclusive) — lower DR = more SEO upside
-        dr_max: Maximum DR (inclusive) — upper bound
-    """
-    print(f"\n[1/3] Ahrefs Batch Analysis ({len(domains)} domains)...")
+    """Run Ahrefs batch analysis and filter by DR range."""
+    print(f"\n[1/5] Ahrefs Batch Analysis ({len(domains)} domains)...")
     print(f"  DR filter: {dr_min} <= DR <= {dr_max}")
 
     results = client.batch_analysis_chunked(domains)
@@ -79,9 +74,43 @@ def run_ahrefs_analysis(client: AhrefsClient, domains: list[str],
     return df.reset_index(drop=True)
 
 
+def run_competitor_discovery(client: AhrefsClient, seed_domains: list[str],
+                              dr_min: int = 10, dr_max: int = 70,
+                              seeds_to_use: int = 30,
+                              per_seed_limit: int = 20) -> pd.DataFrame:
+    """Discover new domains via Ahrefs organic competitor analysis."""
+    print(f"\n[2/5] Competitor Discovery (using {min(seeds_to_use, len(seed_domains))} seeds)...")
+
+    # Use a subset of seeds to avoid excessive API calls
+    seeds = seed_domains[:seeds_to_use]
+
+    discovered = client.discover_competitors_for_seeds(
+        seeds,
+        per_seed_limit=per_seed_limit,
+        dr_min=dr_min,
+        dr_max=dr_max,
+    )
+
+    if not discovered:
+        print("  No new competitors discovered.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(discovered)
+
+    # Rename 'domain' to 'target' for consistency
+    if "domain" in df.columns:
+        df = df.rename(columns={"domain": "target"})
+
+    # Mark as auto-discovered
+    df["discovery_method"] = "auto"
+
+    print(f"  Found {len(df)} new prospect domains")
+    return df.reset_index(drop=True)
+
+
 def run_enrichment(domains: list[str]) -> pd.DataFrame:
     """Enrich domains with company info via web scraping."""
-    print(f"\n[2/3] Enriching site info ({len(domains)} domains)...")
+    print(f"\n[3/5] Enriching site info ({len(domains)} domains)...")
 
     pbar = tqdm(total=len(domains), desc="  Scraping")
 
@@ -103,16 +132,69 @@ def run_enrichment(domains: list[str]) -> pd.DataFrame:
     return df
 
 
-def merge_and_export(ahrefs_df: pd.DataFrame, enrichment_df: pd.DataFrame,
-                      output_dir: str, limit: int | None = None) -> str:
-    """Merge Ahrefs data with enrichment data and export."""
-    print(f"\n[3/3] Merging & exporting...")
+def run_person_search(domains: list[str], company_names: dict[str, str]) -> pd.DataFrame:
+    """Search for key persons (marketing/web department heads) for each domain."""
+    print(f"\n[4/5] Key Person Search ({len(domains)} domains)...")
 
-    # Merge on domain/target
+    pairs = [(d, company_names.get(d, "")) for d in domains]
+
+    pbar = tqdm(total=len(domains), desc="  Searching")
+
+    def progress(current, total, domain):
+        pbar.update(1)
+        pbar.set_postfix_str(domain[:30])
+
+    results = find_key_persons_batch(pairs, progress_callback=progress)
+    pbar.close()
+
+    # Flatten: pick the best person per domain (marketing-related first)
+    rows = []
+    for domain, persons in results.items():
+        if persons:
+            # First person is already prioritized (marketing > others)
+            best = persons[0]
+            row = {
+                "domain": domain,
+                "person_name": best["person_name"],
+                "person_title": best["person_title"],
+                "person_source": best["person_source"],
+            }
+            # If there are additional persons, add as person_2, person_3
+            for i, p in enumerate(persons[1:3], start=2):
+                row[f"person_{i}_name"] = p["person_name"]
+                row[f"person_{i}_title"] = p["person_title"]
+                row[f"person_{i}_source"] = p["person_source"]
+        else:
+            row = {
+                "domain": domain,
+                "person_name": "",
+                "person_title": "",
+                "person_source": "",
+            }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def merge_and_export(ahrefs_df: pd.DataFrame, enrichment_df: pd.DataFrame,
+                      person_df: pd.DataFrame, output_dir: str,
+                      limit: int | None = None) -> str:
+    """Merge all data and export to CSV + Excel."""
+    print(f"\n[5/5] Merging & exporting...")
+
+    # Merge Ahrefs + enrichment
     if "target" in ahrefs_df.columns and "domain" in enrichment_df.columns:
         merged = ahrefs_df.merge(enrichment_df, left_on="target", right_on="domain", how="left")
     else:
         merged = ahrefs_df
+
+    # Merge person data
+    if not person_df.empty and "target" in merged.columns and "domain" in person_df.columns:
+        merged = merged.merge(person_df, left_on="target", right_on="domain",
+                               how="left", suffixes=("", "_person"))
+        # Drop duplicate domain column
+        if "domain_person" in merged.columns:
+            merged = merged.drop(columns=["domain_person"])
 
     if limit:
         merged = merged.head(limit)
@@ -121,7 +203,11 @@ def merge_and_export(ahrefs_df: pd.DataFrame, enrichment_df: pd.DataFrame,
     preferred_order = [
         "target", "company_name", "industry", "domain_rating", "ahrefs_rank",
         "organic_traffic", "organic_keywords", "referring_domains", "linked_domains",
+        "person_name", "person_title", "person_source",
+        "person_2_name", "person_2_title", "person_2_source",
+        "person_3_name", "person_3_title", "person_3_source",
         "phone_numbers", "contact_page", "company_page",
+        "discovery_method", "discovered_from",
     ]
     existing_cols = [c for c in preferred_order if c in merged.columns]
     other_cols = [c for c in merged.columns if c not in preferred_order]
@@ -138,9 +224,20 @@ def merge_and_export(ahrefs_df: pd.DataFrame, enrichment_df: pd.DataFrame,
         "organic_keywords": "オーガニックKW数",
         "referring_domains": "被リンクドメイン数",
         "linked_domains": "発リンクドメイン数",
+        "person_name": "担当者名",
+        "person_title": "役職",
+        "person_source": "情報ソース",
+        "person_2_name": "担当者名2",
+        "person_2_title": "役職2",
+        "person_2_source": "情報ソース2",
+        "person_3_name": "担当者名3",
+        "person_3_title": "役職3",
+        "person_3_source": "情報ソース3",
         "phone_numbers": "電話番号",
         "contact_page": "問い合わせページ",
         "company_page": "会社概要ページ",
+        "discovery_method": "発見方法",
+        "discovered_from": "発見元ドメイン",
     }
     merged = merged.rename(columns=column_names)
 
@@ -161,12 +258,8 @@ def merge_and_export(ahrefs_df: pd.DataFrame, enrichment_df: pd.DataFrame,
     return csv_path
 
 
-def run_demo_mode(output_dir: str, limit: int = 50):
-    """Demo mode: generate list without Ahrefs API (uses domain list + enrichment only).
-
-    APIキーがない場合でもドメインリストからスクレイピングベースの
-    リストを生成できるデモモード。
-    """
+def run_demo_mode(output_dir: str, limit: int = 50, skip_persons: bool = False):
+    """Demo mode: generate list without Ahrefs API."""
     print("=" * 60)
     print("NWlist - Demo Mode (No Ahrefs API)")
     print("=" * 60)
@@ -193,8 +286,16 @@ def run_demo_mode(output_dir: str, limit: int = 50):
     # Enrichment
     enrichment_df = run_enrichment(domains)
 
+    # Person search
+    person_df = pd.DataFrame()
+    if not skip_persons:
+        company_names = {}
+        if "domain" in enrichment_df.columns and "company_name" in enrichment_df.columns:
+            company_names = dict(zip(enrichment_df["domain"], enrichment_df["company_name"]))
+        person_df = run_person_search(domains, company_names)
+
     # Export
-    csv_path = merge_and_export(ahrefs_df, enrichment_df, output_dir, limit)
+    csv_path = merge_and_export(ahrefs_df, enrichment_df, person_df, output_dir, limit)
 
     print(f"\n{'=' * 60}")
     print("Done! Ahrefs APIキーを設定すると、DR・トラフィック等の")
@@ -239,12 +340,28 @@ def main():
         "--enrich-only", action="store_true",
         help="Skip Ahrefs API, only run enrichment on domain list",
     )
+    parser.add_argument(
+        "--discover", action="store_true", default=True,
+        help="Enable competitor auto-discovery via Ahrefs API (default: on)",
+    )
+    parser.add_argument(
+        "--no-discover", action="store_true",
+        help="Disable competitor auto-discovery",
+    )
+    parser.add_argument(
+        "--discovery-seeds", type=int, default=30,
+        help="Number of seed domains to use for competitor discovery (default: 30)",
+    )
+    parser.add_argument(
+        "--skip-persons", action="store_true",
+        help="Skip key person search (faster execution)",
+    )
 
     args = parser.parse_args()
 
     # Demo mode
     if args.demo or args.enrich_only:
-        run_demo_mode(args.output_dir, args.limit)
+        run_demo_mode(args.output_dir, args.limit, args.skip_persons)
         return
 
     # Check API token
@@ -271,21 +388,52 @@ def main():
     print("NWlist - Neutral Works ABM Prospect List Generator")
     print("=" * 60)
 
-    # Step 1: Ahrefs Analysis
+    # Step 1: Ahrefs Analysis on seed domains
     ahrefs_df = run_ahrefs_analysis(client, domains, args.dr_min, args.dr_max)
 
     if ahrefs_df.empty:
         print("\nNo domains matched the DR filter. Try adjusting --dr-min / --dr-max.")
         sys.exit(0)
 
-    # Step 2: Enrichment
+    # Step 2: Competitor Discovery (auto-expand domain list)
+    if args.discover and not args.no_discover:
+        seed_domains = ahrefs_df["target"].tolist()
+        discovered_df = run_competitor_discovery(
+            client, seed_domains,
+            dr_min=args.dr_min, dr_max=args.dr_max,
+            seeds_to_use=args.discovery_seeds,
+        )
+
+        if not discovered_df.empty:
+            # Mark original domains
+            ahrefs_df["discovery_method"] = "seed"
+
+            # Combine seed + discovered
+            ahrefs_df = pd.concat([ahrefs_df, discovered_df], ignore_index=True)
+
+            # Remove duplicates
+            if "target" in ahrefs_df.columns:
+                ahrefs_df = ahrefs_df.drop_duplicates(subset=["target"], keep="first")
+
+            print(f"  Total domains after discovery: {len(ahrefs_df)}")
+
+    # Step 3: Enrichment
     filtered_domains = ahrefs_df["target"].tolist()
     if args.limit:
         filtered_domains = filtered_domains[:args.limit]
     enrichment_df = run_enrichment(filtered_domains)
 
-    # Step 3: Merge & Export
-    csv_path = merge_and_export(ahrefs_df, enrichment_df, args.output_dir, args.limit)
+    # Step 4: Key Person Search
+    person_df = pd.DataFrame()
+    if not args.skip_persons:
+        company_names = {}
+        if "domain" in enrichment_df.columns and "company_name" in enrichment_df.columns:
+            company_names = dict(zip(enrichment_df["domain"], enrichment_df["company_name"]))
+        person_df = run_person_search(filtered_domains, company_names)
+
+    # Step 5: Merge & Export
+    csv_path = merge_and_export(ahrefs_df, enrichment_df, person_df,
+                                 args.output_dir, args.limit)
 
     print(f"\n{'=' * 60}")
     print("Complete! Generated prospect list for Neutral Works ABM.")
