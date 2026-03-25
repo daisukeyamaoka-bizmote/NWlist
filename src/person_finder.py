@@ -3,17 +3,28 @@
 企業のマーケティング/ウェブ担当責任者を以下のソースから調査:
 1. 企業サイトの役員紹介・チームページ
 2. PR TIMES等のプレスリリース
-3. Google検索（企業名 × 役職キーワード）
+3. メディア記事検索（MarkeZine, Web担当者Forum, ferret）
+
+Claude Sonnet APIが利用可能な場合:
+- スクレイピングした記事/ページ本文をAIで読解
+- 正規表現では拾えない人名・役職・就任時期を正確に抽出
+- 情報の鮮度（記事日付）も判定
 
 取得情報:
 - 担当者名
 - 役職
 - 情報ソースURL
+- 記事日付（AI抽出時）
+- 信頼度（AI抽出時）
 """
 
 import ipaddress
+import json
+import logging
+import os
 import re
 import socket
+import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -21,7 +32,142 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# 調査対象の役職キーワード
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------
+# Claude Sonnet client (lazy init)
+# -------------------------------------------------------------------
+_anthropic_client = None
+_anthropic_init_lock = threading.Lock()
+
+
+def _get_anthropic_client():
+    """Anthropicクライアントをlazy初期化（スレッドセーフ）."""
+    global _anthropic_client
+    if _anthropic_client is not None:
+        return _anthropic_client
+
+    with _anthropic_init_lock:
+        if _anthropic_client is not None:
+            return _anthropic_client
+
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not api_key or api_key == "your_anthropic_api_key_here":
+            return None
+
+        try:
+            import anthropic
+            _anthropic_client = anthropic.Anthropic(api_key=api_key)
+            logger.info("Anthropic API client initialized (Claude Sonnet)")
+            return _anthropic_client
+        except Exception as e:
+            logger.warning(f"Anthropic API client init failed: {e}")
+            return None
+
+
+def _is_ai_available() -> bool:
+    return _get_anthropic_client() is not None
+
+
+# -------------------------------------------------------------------
+# AI extraction via Claude Sonnet
+# -------------------------------------------------------------------
+_EXTRACT_PROMPT = """\
+以下は企業「{company_name}」({domain})に関するWebページまたは記事のテキストです。
+
+このテキストから、この企業のマーケティング・デジタル・ウェブ・広報・経営に関わる\
+担当者の情報を抽出してください。
+
+### 抽出ルール
+- 対象企業に所属する人物のみ抽出（インタビュアーや記者は除外）
+- 役職が明記されている人物のみ
+- 最大5名まで
+- 記事の公開日・更新日があれば記載
+
+### 出力形式（JSON配列）
+```json
+[
+  {{
+    "person_name": "姓 名",
+    "person_title": "役職名",
+    "article_date": "YYYY-MM-DD or empty",
+    "confidence": "high/medium/low",
+    "reason": "抽出根拠を1行で"
+  }}
+]
+```
+
+人物が見つからない場合は空配列 `[]` を返してください。
+JSON以外のテキストは出力しないでください。
+
+---
+テキスト:
+{text}
+"""
+
+# AIリクエストのテキスト上限（トークン節約）
+_MAX_TEXT_CHARS = 6000
+
+
+def _extract_persons_with_ai(text: str, domain: str, company_name: str,
+                              source_url: str) -> list[dict]:
+    """Claude Sonnetで記事/ページ本文から担当者情報を抽出."""
+    client = _get_anthropic_client()
+    if client is None:
+        return []
+
+    # テキストが長すぎる場合は冒頭と末尾を残して切り詰め
+    if len(text) > _MAX_TEXT_CHARS:
+        half = _MAX_TEXT_CHARS // 2
+        text = text[:half] + "\n...(中略)...\n" + text[-half:]
+
+    prompt = _EXTRACT_PROMPT.format(
+        company_name=company_name or domain,
+        domain=domain,
+        text=text,
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = response.content[0].text.strip()
+
+        # JSON部分を抽出（```json ... ``` で囲まれている場合に対応）
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+        if not json_match:
+            return []
+
+        persons_raw = json.loads(json_match.group())
+        persons = []
+        for p in persons_raw:
+            if not isinstance(p, dict):
+                continue
+            name = p.get("person_name", "").strip()
+            title = p.get("person_title", "").strip()
+            if not name or not title:
+                continue
+            persons.append({
+                "person_name": name,
+                "person_title": title,
+                "person_source": source_url,
+                "is_marketing_related": _is_marketing_related(title),
+                "article_date": p.get("article_date", ""),
+                "confidence": p.get("confidence", "medium"),
+                "ai_reason": p.get("reason", ""),
+            })
+        return persons
+
+    except Exception as e:
+        logger.warning(f"AI extraction failed for {domain}: {e}")
+        return []
+
+
+# -------------------------------------------------------------------
+# Constants & patterns (regex fallback)
+# -------------------------------------------------------------------
 TARGET_TITLES = [
     "CMO", "CTO", "COO", "CDO", "CIO",
     "マーケティング", "デジタル", "ウェブ", "Web",
@@ -29,7 +175,6 @@ TARGET_TITLES = [
     "VP", "Vice President",
 ]
 
-# 役職として認識するパターン
 TITLE_PATTERNS = [
     r'(代表取締役[社会]?長?)',
     r'(取締役\S{0,10})',
@@ -41,12 +186,10 @@ TITLE_PATTERNS = [
     r'(Head\s+of\s+\w+)',
 ]
 
-# 日本人名のパターン（姓名の間にスペース）
 NAME_PATTERN = re.compile(
     r'([一-龥ぁ-んァ-ヶ]{1,4})\s*([一-龥ぁ-んァ-ヶ]{1,4})'
 )
 
-# 企業サイトの役員・チームページパス候補
 TEAM_PAGE_PATHS = [
     "/company/team",
     "/company/officer",
@@ -65,8 +208,9 @@ TEAM_PAGE_PATHS = [
     "/members",
 ]
 
-import threading
-
+# -------------------------------------------------------------------
+# HTTP session (thread-safe)
+# -------------------------------------------------------------------
 _DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -76,7 +220,6 @@ _DEFAULT_HEADERS = {
     "Accept-Language": "ja,en;q=0.9",
 }
 
-# スレッドローカルなSessionで並列時の安全性を確保
 _thread_local = threading.local()
 
 
@@ -87,6 +230,9 @@ def _get_session() -> requests.Session:
     return _thread_local.session
 
 
+# -------------------------------------------------------------------
+# SSRF protection
+# -------------------------------------------------------------------
 _BLOCKED_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254"}
 
 
@@ -123,6 +269,9 @@ def _fetch_page(url: str, timeout: int = 10) -> BeautifulSoup | None:
         return None
 
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 def _is_marketing_related(title: str) -> bool:
     """役職がマーケ/ウェブ/デジタル関連かどうか."""
     marketing_keywords = [
@@ -134,7 +283,7 @@ def _is_marketing_related(title: str) -> bool:
 
 
 def _extract_persons_from_soup(soup: BeautifulSoup, source_url: str) -> list[dict]:
-    """HTMLから役職+名前のペアを抽出."""
+    """HTMLから役職+名前のペアを正規表現で抽出（フォールバック用）."""
     persons = []
     text = soup.get_text(separator="\n")
     lines = text.split("\n")
@@ -144,7 +293,6 @@ def _extract_persons_from_soup(soup: BeautifulSoup, source_url: str) -> list[dic
         if not line or len(line) > 200:
             continue
 
-        # 役職パターンにマッチするか
         matched_title = ""
         for pattern in TITLE_PATTERNS:
             m = re.search(pattern, line)
@@ -155,14 +303,12 @@ def _extract_persons_from_soup(soup: BeautifulSoup, source_url: str) -> list[dic
         if not matched_title:
             continue
 
-        # 同じ行か前後2行から名前を探す
         search_range = lines[max(0, i-1):i+3]
         for search_line in search_range:
             search_line = search_line.strip()
             name_match = NAME_PATTERN.search(search_line)
             if name_match:
                 name = f"{name_match.group(1)} {name_match.group(2)}"
-                # 役職文字列自体を名前として誤検出しないようチェック
                 if name != matched_title and len(name) >= 3:
                     persons.append({
                         "person_name": name,
@@ -175,7 +321,28 @@ def _extract_persons_from_soup(soup: BeautifulSoup, source_url: str) -> list[dic
     return persons
 
 
-def _search_company_team_pages(domain: str) -> list[dict]:
+def _extract_persons_from_soup_smart(soup: BeautifulSoup, source_url: str,
+                                      domain: str, company_name: str) -> list[dict]:
+    """AI利用可能ならClaude Sonnet、そうでなければ正規表現で抽出."""
+    text = soup.get_text(separator="\n")
+    # 極端に短いページはスキップ
+    clean_text = "\n".join(line.strip() for line in text.split("\n") if line.strip())
+    if len(clean_text) < 50:
+        return []
+
+    if _is_ai_available():
+        persons = _extract_persons_with_ai(clean_text, domain, company_name, source_url)
+        if persons:
+            return persons
+        # AI抽出が空なら正規表現にフォールバック
+
+    return _extract_persons_from_soup(soup, source_url)
+
+
+# -------------------------------------------------------------------
+# Source searchers
+# -------------------------------------------------------------------
+def _search_company_team_pages(domain: str, company_name: str = "") -> list[dict]:
     """企業サイトの役員/チームページから担当者を探す."""
     base_url = f"https://{domain}"
     persons = []
@@ -184,15 +351,15 @@ def _search_company_team_pages(domain: str) -> list[dict]:
         url = f"{base_url}{path}"
         soup = _fetch_page(url)
         if soup:
-            found = _extract_persons_from_soup(soup, url)
+            found = _extract_persons_from_soup_smart(soup, url, domain, company_name)
             persons.extend(found)
             if found:
-                break  # 見つかったら最初のページで十分
+                break
 
     return persons
 
 
-def _search_prtimes(company_name: str, max_results: int = 5) -> list[dict]:
+def _search_prtimes(company_name: str, domain: str = "", max_results: int = 5) -> list[dict]:
     """PR TIMESでプレスリリースから担当者を検索."""
     if not company_name:
         return []
@@ -209,7 +376,6 @@ def _search_prtimes(company_name: str, max_results: int = 5) -> list[dict]:
         if not soup:
             continue
 
-        # PR TIMESの検索結果からリンクを取得
         articles = soup.find_all("a", href=True)
         count = 0
         for a in articles:
@@ -218,27 +384,23 @@ def _search_prtimes(company_name: str, max_results: int = 5) -> list[dict]:
                 article_url = href if href.startswith("http") else f"https://prtimes.jp{href}"
                 article_soup = _fetch_page(article_url)
                 if article_soup:
-                    found = _extract_persons_from_soup(article_soup, article_url)
+                    found = _extract_persons_from_soup_smart(
+                        article_soup, article_url, domain, company_name)
                     persons.extend(found)
                     count += 1
                     if persons:
-                        return persons  # 見つかったら早期リターン
+                        return persons
 
     return persons
 
 
-def _search_google(company_name: str, max_results: int = 3) -> list[dict]:
-    """Google検索で担当者情報を探す.
-
-    Google Custom Search APIが無い場合はスキップ。
-    代わりにメディア記事の直接検索を試みる。
-    """
+def _search_media(company_name: str, domain: str = "", max_results: int = 3) -> list[dict]:
+    """メディア記事検索で担当者情報を探す."""
     if not company_name:
         return []
 
     persons = []
 
-    # 主要メディアで直接検索
     media_searches = [
         ("MarkeZine", f"https://markezine.jp/search?q={urllib.parse.quote(company_name + ' マーケティング')}"),
         ("Web担当者Forum", f"https://webtan.impress.co.jp/search/node/{urllib.parse.quote(company_name)}"),
@@ -250,17 +412,16 @@ def _search_google(company_name: str, max_results: int = 3) -> list[dict]:
         if not soup:
             continue
 
-        # 検索結果の記事リンクを取得
         links = soup.find_all("a", href=True)
         count = 0
         for link in links:
             href = link["href"]
-            # 記事ページっぽいURLだけ対象
             if any(p in href for p in ["/article/", "/articles/", "/interview/"]):
                 article_url = href if href.startswith("http") else f"https://{urllib.parse.urlparse(search_url).netloc}{href}"
                 article_soup = _fetch_page(article_url)
                 if article_soup:
-                    found = _extract_persons_from_soup(article_soup, article_url)
+                    found = _extract_persons_from_soup_smart(
+                        article_soup, article_url, domain, company_name)
                     persons.extend(found)
                     count += 1
                     if count >= max_results or persons:
@@ -272,6 +433,9 @@ def _search_google(company_name: str, max_results: int = 3) -> list[dict]:
     return persons
 
 
+# -------------------------------------------------------------------
+# Main entry points
+# -------------------------------------------------------------------
 def find_key_persons(domain: str, company_name: str = "") -> list[dict]:
     """企業のマーケ/ウェブ担当責任者を調査.
 
@@ -280,29 +444,35 @@ def find_key_persons(domain: str, company_name: str = "") -> list[dict]:
     2. PR TIMESのプレスリリース
     3. メディア記事検索
 
+    AI利用可能な場合はClaude Sonnetで正確に読解。
+    利用不可の場合は正規表現にフォールバック。
+
     Returns:
         List of {
             "person_name": str,
             "person_title": str,
             "person_source": str,
             "is_marketing_related": bool,
+            "article_date": str (AI時のみ),
+            "confidence": str (AI時のみ),
+            "ai_reason": str (AI時のみ),
         }
     """
     all_persons = []
 
     # 1. 企業サイトの役員ページ
-    team_persons = _search_company_team_pages(domain)
+    team_persons = _search_company_team_pages(domain, company_name)
     all_persons.extend(team_persons)
 
     # 2. PR TIMES検索
     if company_name:
-        pr_persons = _search_prtimes(company_name)
+        pr_persons = _search_prtimes(company_name, domain)
         all_persons.extend(pr_persons)
 
     # 3. メディア記事検索（まだマーケ関連の人が見つかっていない場合）
-    marketing_found = any(p["is_marketing_related"] for p in all_persons)
+    marketing_found = any(p.get("is_marketing_related") for p in all_persons)
     if not marketing_found and company_name:
-        media_persons = _search_google(company_name)
+        media_persons = _search_media(company_name, domain)
         all_persons.extend(media_persons)
 
     # 重複排除（名前ベース）
@@ -314,10 +484,10 @@ def find_key_persons(domain: str, company_name: str = "") -> list[dict]:
             unique.append(p)
 
     # マーケ関連を優先、その後役員クラスを表示
-    marketing = [p for p in unique if p["is_marketing_related"]]
-    others = [p for p in unique if not p["is_marketing_related"]]
+    marketing = [p for p in unique if p.get("is_marketing_related")]
+    others = [p for p in unique if not p.get("is_marketing_related")]
 
-    return (marketing + others)[:5]  # 最大5名
+    return (marketing + others)[:5]
 
 
 def find_key_persons_batch(domains_with_names: list[tuple[str, str]],
@@ -336,6 +506,13 @@ def find_key_persons_batch(domains_with_names: list[tuple[str, str]],
     results = {}
     total = len(domains_with_names)
     completed = 0
+
+    # AI使用時は並列数を下げてレート制限を守る
+    if _is_ai_available():
+        max_workers = min(max_workers, 4)
+        logger.info("Claude Sonnet AI抽出モード（並列数: %d）", max_workers)
+    else:
+        logger.info("正規表現フォールバックモード（並列数: %d）", max_workers)
 
     def _process(pair: tuple[str, str]) -> tuple[str, list[dict]]:
         domain, company_name = pair
