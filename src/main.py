@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from ahrefs_client import AhrefsClient
 from enrichment import enrich_domains_batch
+from history import filter_new_domains, get_history_stats, load_history, save_history
 from person_finder import find_key_persons_batch
 from target_domains import (
     INDUSTRY_TARGETS,
@@ -178,7 +179,9 @@ def run_person_search(domains: list[str], company_names: dict[str, str]) -> pd.D
 
 def merge_and_export(ahrefs_df: pd.DataFrame, enrichment_df: pd.DataFrame,
                       person_df: pd.DataFrame, output_dir: str,
-                      limit: int | None = None) -> str:
+                      limit: int | None = None,
+                      update_history: bool = False,
+                      history_path: str = "") -> str:
     """Merge all data and export to CSV + Excel."""
     print(f"\n[5/5] Merging & exporting...")
 
@@ -254,6 +257,11 @@ def merge_and_export(ahrefs_df: pd.DataFrame, enrichment_df: pd.DataFrame,
     print(f"  CSV:   {csv_path}")
     print(f"  Excel: {xlsx_path}")
     print(f"  Total: {len(merged)} prospects")
+
+    # Update history with exported domains
+    if update_history and "ドメイン" in merged.columns:
+        exported_domains = merged["ドメイン"].tolist()
+        save_history(exported_domains, history_path or os.path.join(output_dir, "history.csv"))
 
     return csv_path
 
@@ -356,8 +364,47 @@ def main():
         "--skip-persons", action="store_true",
         help="Skip key person search (faster execution)",
     )
+    parser.add_argument(
+        "--exclude-history", action="store_true",
+        help="Exclude previously exported domains (for weekly new list generation)",
+    )
+    parser.add_argument(
+        "--history-path", type=str, default="",
+        help="Path to history CSV file (default: output/history.csv)",
+    )
+    parser.add_argument(
+        "--reset-history", action="store_true",
+        help="Clear export history and start fresh",
+    )
+    parser.add_argument(
+        "--history-stats", action="store_true",
+        help="Show history statistics and exit",
+    )
 
     args = parser.parse_args()
+
+    history_path = args.history_path or os.path.join(args.output_dir, "history.csv")
+
+    # History stats
+    if args.history_stats:
+        stats = get_history_stats(history_path)
+        print("=" * 60)
+        print("NWlist - Export History Stats")
+        print("=" * 60)
+        print(f"  Total exported domains: {stats['total_domains']}")
+        print(f"  Total export runs:      {stats.get('total_exports', 'N/A')}")
+        print(f"  First export:           {stats.get('first_export', 'N/A')}")
+        print(f"  Last export:            {stats.get('last_export', 'N/A')}")
+        return
+
+    # Reset history
+    if args.reset_history:
+        if os.path.exists(history_path):
+            os.remove(history_path)
+            print(f"History cleared: {history_path}")
+        else:
+            print("No history file found.")
+        return
 
     # Demo mode
     if args.demo or args.enrich_only:
@@ -417,6 +464,20 @@ def main():
 
             print(f"  Total domains after discovery: {len(ahrefs_df)}")
 
+    # Exclude previously exported domains
+    if args.exclude_history and "target" in ahrefs_df.columns:
+        all_targets = ahrefs_df["target"].tolist()
+        new_targets = filter_new_domains(all_targets, history_path)
+
+        if len(new_targets) < len(all_targets):
+            ahrefs_df = ahrefs_df[ahrefs_df["target"].isin(new_targets)].reset_index(drop=True)
+            print(f"  After history exclusion: {len(ahrefs_df)} new domains")
+
+        if ahrefs_df.empty:
+            print("\nAll discovered domains have been exported previously.")
+            print("Try increasing --discovery-seeds or adding new seed domains.")
+            sys.exit(0)
+
     # Step 3: Enrichment
     filtered_domains = ahrefs_df["target"].tolist()
     if args.limit:
@@ -433,7 +494,9 @@ def main():
 
     # Step 5: Merge & Export
     csv_path = merge_and_export(ahrefs_df, enrichment_df, person_df,
-                                 args.output_dir, args.limit)
+                                 args.output_dir, args.limit,
+                                 update_history=args.exclude_history,
+                                 history_path=history_path)
 
     print(f"\n{'=' * 60}")
     print("Complete! Generated prospect list for Neutral Works ABM.")
