@@ -210,6 +210,7 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
             "person_2_name", "person_2_title", "person_2_source",
             "person_3_name", "person_3_title", "person_3_source",
             "phone_numbers", "contact_page", "company_page",
+            "freshness_status", "last_updated", "freshness_detail",
             "discovery_method", "discovered_from",
         ]
         existing_cols = [c for c in preferred_order if c in merged.columns]
@@ -225,8 +226,10 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
             "person_2_name": "担当者名2", "person_2_title": "役職2", "person_2_source": "情報ソース2",
             "person_3_name": "担当者名3", "person_3_title": "役職3", "person_3_source": "情報ソース3",
             "phone_numbers": "電話番号", "contact_page": "問い合わせページ",
-            "company_page": "会社概要ページ", "discovery_method": "発見方法",
-            "discovered_from": "発見元ドメイン",
+            "company_page": "会社概要ページ",
+            "freshness_status": "鮮度ステータス", "last_updated": "最終更新",
+            "freshness_detail": "鮮度チェック詳細",
+            "discovery_method": "発見方法", "discovered_from": "発見元ドメイン",
         }
         merged = merged.rename(columns=column_names)
 
@@ -241,8 +244,18 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
         if exclude_history and "ドメイン" in merged.columns:
             save_history(merged["ドメイン"].tolist(), os.path.join(OUTPUT_BASE, "history.csv"))
 
+        # Freshness summary
+        freshness_col = "鮮度ステータス"
+        if freshness_col in merged.columns:
+            ok_count = (merged[freshness_col] == "OK").sum()
+            stale_count = (merged[freshness_col] == "STALE").sum()
+            unknown_count = (merged[freshness_col] == "UNKNOWN").sum()
+            freshness_msg = f"（鮮度: OK {ok_count}件 / 要確認 {stale_count}件 / 不明 {unknown_count}件）"
+        else:
+            freshness_msg = ""
+
         _job_state["result_path"] = output_dir
-        _update_progress(5, f"完了！ {len(merged)} 件のリストを生成しました")
+        _update_progress(5, f"完了！ {len(merged)} 件のリストを生成しました {freshness_msg}")
 
     except Exception as e:
         _job_state["error"] = str(e)

@@ -13,6 +13,7 @@
 
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
@@ -61,20 +62,31 @@ TEAM_PAGE_PATHS = [
     "/members",
 ]
 
-_SESSION = requests.Session()
-_SESSION.headers.update({
+import threading
+
+_DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ja,en;q=0.9",
-})
+}
+
+# スレッドローカルなSessionで並列時の安全性を確保
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+        _thread_local.session.headers.update(_DEFAULT_HEADERS)
+    return _thread_local.session
 
 
 def _fetch_page(url: str, timeout: int = 10) -> BeautifulSoup | None:
     try:
-        resp = _SESSION.get(url, timeout=timeout, allow_redirects=True)
+        resp = _get_session().get(url, timeout=timeout, allow_redirects=True)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding
         return BeautifulSoup(resp.text, "html.parser")
@@ -280,28 +292,37 @@ def find_key_persons(domain: str, company_name: str = "") -> list[dict]:
 
 
 def find_key_persons_batch(domains_with_names: list[tuple[str, str]],
-                            progress_callback=None) -> dict[str, list[dict]]:
-    """複数ドメインの担当者を一括調査.
+                            progress_callback=None,
+                            max_workers: int = 8) -> dict[str, list[dict]]:
+    """複数ドメインの担当者を一括調査（並列処理）.
 
     Args:
         domains_with_names: List of (domain, company_name) tuples
         progress_callback: Optional callback(current, total, domain)
+        max_workers: 並列スレッド数（デフォルト8）
 
     Returns:
         Dict mapping domain -> list of person dicts
     """
     results = {}
     total = len(domains_with_names)
+    completed = 0
 
-    for i, (domain, company_name) in enumerate(domains_with_names):
-        if progress_callback:
-            progress_callback(i + 1, total, domain)
-
+    def _process(pair: tuple[str, str]) -> tuple[str, list[dict]]:
+        domain, company_name = pair
         try:
             persons = find_key_persons(domain, company_name)
         except Exception:
             persons = []
+        return domain, persons
 
-        results[domain] = persons
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_process, pair): pair for pair in domains_with_names}
+        for future in as_completed(futures):
+            domain, persons = future.result()
+            results[domain] = persons
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, domain)
 
     return results
