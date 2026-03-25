@@ -36,6 +36,9 @@ OUTPUT_BASE = str(Path(os.path.join(os.path.dirname(__file__), "..", "output")).
 # Rate limit: track last generation request time
 _last_generate_time = 0.0
 
+# Cancellation flag
+_cancel_event = threading.Event()
+
 # Job state
 _job_lock = threading.Lock()
 _job_state = {
@@ -45,6 +48,7 @@ _job_state = {
     "total_steps": 5,
     "error": "",
     "result_path": "",
+    "cancelled": False,
 }
 
 
@@ -92,6 +96,11 @@ def _update_progress(step: int, message: str):
         _job_state["progress"] = message
 
 
+def _check_cancelled() -> bool:
+    """キャンセルされていたらTrueを返す."""
+    return _cancel_event.is_set()
+
+
 def _get_date_output_dir(base: str = OUTPUT_BASE) -> str:
     """今日の日付フォルダを返す (output/2026-03-25/)."""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -125,6 +134,9 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
             domains = get_domains_by_industry(industry)
 
         # === Step 1: Ahrefs Analysis ===
+        if _check_cancelled():
+            _update_progress(0, "中断しました")
+            return
         _update_progress(1, f"Ahrefs分析中... ({len(domains)} ドメイン)")
 
         if is_demo:
@@ -160,6 +172,9 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
             ahrefs_df = ahrefs_df.reset_index(drop=True)
 
         # === Step 2: Competitor Discovery ===
+        if _check_cancelled():
+            _update_progress(1, "中断しました（Ahrefs分析完了後）")
+            return
         _update_progress(2, "競合ドメイン発見中...")
 
         if not is_demo and "target" in ahrefs_df.columns:
@@ -192,6 +207,9 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
         filtered_domains = ahrefs_df["target"].tolist()[:limit]
 
         # === Step 3: Enrichment ===
+        if _check_cancelled():
+            _update_progress(2, "中断しました（競合発見完了後）")
+            return
         _update_progress(3, f"企業情報取得中... ({len(filtered_domains)} 件)")
 
         enrichment_results = enrich_domains_batch(filtered_domains)
@@ -202,6 +220,9 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
             )
 
         # === Step 4: Person Search ===
+        if _check_cancelled():
+            _update_progress(3, "中断しました（企業情報取得完了後）")
+            return
         person_df = pd.DataFrame()
         if not skip_persons:
             _update_progress(4, f"担当者調査中... ({len(filtered_domains)} 件)")
@@ -236,6 +257,9 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
             _update_progress(4, "担当者調査スキップ")
 
         # === Step 5: Export ===
+        if _check_cancelled():
+            _update_progress(4, "中断しました（担当者調査完了後）")
+            return
         _update_progress(5, "Excel出力中...")
 
         # Merge
@@ -315,6 +339,10 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
             _job_state["error"] = "リスト生成中にエラーが発生しました。設定を確認して再度お試しください。"
     finally:
         with _job_lock:
+            if _cancel_event.is_set():
+                _job_state["cancelled"] = True
+                if not _job_state["progress"].startswith("中断"):
+                    _job_state["progress"] = "中断しました"
             _job_state["running"] = False
 
 
@@ -392,9 +420,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .btn-dl:hover { border-color: #4a6cf7; color: #4a6cf7; }
 .empty { text-align: center; padding: 40px; color: #999; font-size: 14px; }
 
+.btn-cancel { background: #ef4444; color: white; border: none;
+  padding: 10px 24px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;
+  margin-top: 12px; display: none; transition: opacity 0.2s; }
+.btn-cancel:hover { opacity: 0.85; }
+.btn-cancel.active { display: inline-block; }
+
 .error-msg { background: #fef2f2; border: 1px solid #fecaca; color: #dc2626;
   padding: 12px 16px; border-radius: 8px; margin-top: 12px; font-size: 13px; display: none; }
 .error-msg.active { display: block; }
+
+.cancelled-msg { background: #fefce8; border: 1px solid #fde68a; color: #a16207;
+  padding: 12px 16px; border-radius: 8px; margin-top: 12px; font-size: 13px; display: none; }
+.cancelled-msg.active { display: block; }
 </style>
 </head>
 <body>
@@ -453,6 +491,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         <span class="step" id="step-5">5. Excel出力</span>
       </div>
     </div>
+    <button class="btn-cancel" id="btn-cancel" onclick="cancelGeneration()">中断する</button>
+    <div class="cancelled-msg" id="cancelled-msg">リスト生成を中断しました。</div>
     <div class="error-msg" id="error-msg"></div>
   </div>
 
@@ -481,7 +521,9 @@ function startGeneration() {
   btn.disabled = true;
   btn.textContent = '生成中...';
   document.getElementById('progress-area').classList.add('active');
+  document.getElementById('btn-cancel').classList.add('active');
   document.getElementById('error-msg').classList.remove('active');
+  document.getElementById('cancelled-msg').classList.remove('active');
 
   const params = new URLSearchParams({
     industry: document.getElementById('industry').value,
@@ -520,7 +562,10 @@ function pollProgress() {
 
       if (!data.running) {
         clearInterval(pollTimer);
-        if (data.error) {
+        document.getElementById('btn-cancel').classList.remove('active');
+        if (data.cancelled) {
+          document.getElementById('cancelled-msg').classList.add('active');
+        } else if (data.error) {
           showError(data.error);
         }
         resetBtn();
@@ -540,6 +585,22 @@ function resetBtn() {
   const btn = document.getElementById('btn-generate');
   btn.disabled = false;
   btn.textContent = '新規リスト作成';
+}
+
+function cancelGeneration() {
+  const btn = document.getElementById('btn-cancel');
+  btn.disabled = true;
+  btn.textContent = '中断中...';
+  fetch('/api/cancel', { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      btn.disabled = false;
+      btn.textContent = '中断する';
+    })
+    .catch(() => {
+      btn.disabled = false;
+      btn.textContent = '中断する';
+    });
 }
 
 function loadFiles() {
@@ -644,11 +705,13 @@ def api_generate():
         if _job_state["running"]:
             return jsonify({"error": "既にリスト生成が実行中です。完了までお待ちください。"})
 
+        _cancel_event.clear()
         _job_state["running"] = True
         _job_state["progress"] = "開始中..."
         _job_state["step"] = 0
         _job_state["error"] = ""
         _job_state["result_path"] = ""
+        _job_state["cancelled"] = False
 
     _last_generate_time = now
 
@@ -666,6 +729,16 @@ def api_generate():
 def api_progress():
     with _job_lock:
         return jsonify(_job_state.copy())
+
+
+@app.route("/api/cancel", methods=["POST"])
+def api_cancel():
+    """リスト生成を中断する."""
+    with _job_lock:
+        if not _job_state["running"]:
+            return jsonify({"error": "実行中のジョブがありません"})
+    _cancel_event.set()
+    return jsonify({"status": "cancelling"})
 
 
 @app.route("/api/stats")
