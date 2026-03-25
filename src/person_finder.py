@@ -116,14 +116,17 @@ def _extract_persons_with_ai(text: str, domain: str, company_name: str,
     if client is None:
         return []
 
+    # ASCII範囲外の文字を安全に扱う
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
+
     # テキストが長すぎる場合は冒頭と末尾を残して切り詰め
     if len(text) > _MAX_TEXT_CHARS:
         half = _MAX_TEXT_CHARS // 2
         text = text[:half] + "\n...(中略)...\n" + text[-half:]
 
     prompt = _EXTRACT_PROMPT.format(
-        company_name=company_name or domain,
-        domain=domain,
+        company_name=str(company_name or domain),
+        domain=str(domain),
         text=text,
     )
 
@@ -161,7 +164,7 @@ def _extract_persons_with_ai(text: str, domain: str, company_name: str,
         return persons
 
     except Exception as e:
-        logger.warning(f"AI extraction failed for {domain}: {e}")
+        logger.warning("AI extraction failed for %s: %s", domain, e)
         return []
 
 
@@ -324,7 +327,12 @@ def _extract_persons_from_soup(soup: BeautifulSoup, source_url: str) -> list[dic
 def _extract_persons_from_soup_smart(soup: BeautifulSoup, source_url: str,
                                       domain: str, company_name: str) -> list[dict]:
     """AI利用可能ならClaude Sonnet、そうでなければ正規表現で抽出."""
-    text = soup.get_text(separator="\n")
+    try:
+        text = soup.get_text(separator="\n")
+    except Exception:
+        return []
+    # エンコーディングを安全に正規化
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
     # 極端に短いページはスキップ
     clean_text = "\n".join(line.strip() for line in text.split("\n") if line.strip())
     if len(clean_text) < 50:
