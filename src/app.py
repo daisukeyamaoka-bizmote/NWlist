@@ -1,7 +1,9 @@
 """NWlist Web UI - リスト生成をブラウザから操作."""
 
 import io
+import logging
 import os
+import re
 import sys
 import threading
 import zipfile
@@ -9,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string, send_file
+from flask import Flask, jsonify, render_template_string, request, send_file
 
 load_dotenv()
 
@@ -24,9 +26,15 @@ from target_domains import INDUSTRY_TARGETS, get_all_domains, get_domains_by_ind
 
 import pandas as pd
 
-app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
-OUTPUT_BASE = os.path.join(os.path.dirname(__file__), "..", "output")
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", os.urandom(32).hex())
+
+OUTPUT_BASE = str(Path(os.path.join(os.path.dirname(__file__), "..", "output")).resolve())
+
+# Rate limit: track last generation request time
+_last_generate_time = 0.0
 
 # Job state
 _job_lock = threading.Lock()
@@ -40,9 +48,48 @@ _job_state = {
 }
 
 
+# -------------------------------------------------------------------
+# Security: headers
+# -------------------------------------------------------------------
+@app.after_request
+def _set_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'"
+    )
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+
+# -------------------------------------------------------------------
+# Security: path validation helper
+# -------------------------------------------------------------------
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _safe_resolve(date: str, filename: str | None = None) -> Path | None:
+    """Resolve path under OUTPUT_BASE, returning None if traversal detected."""
+    if not _DATE_RE.match(date):
+        return None
+    parts = [OUTPUT_BASE, date]
+    if filename is not None:
+        safe_name = os.path.basename(filename)
+        if not safe_name or safe_name.startswith("."):
+            return None
+        parts.append(safe_name)
+    resolved = Path(os.path.join(*parts)).resolve()
+    if not str(resolved).startswith(OUTPUT_BASE):
+        return None
+    return resolved
+
+
 def _update_progress(step: int, message: str):
-    _job_state["step"] = step
-    _job_state["progress"] = message
+    with _job_lock:
+        _job_state["step"] = step
+        _job_state["progress"] = message
 
 
 def _get_date_output_dir(base: str = OUTPUT_BASE) -> str:
@@ -258,9 +305,12 @@ def _run_list_generation(industry: str, limit: int, dr_min: int, dr_max: int,
         _update_progress(5, f"完了！ {len(merged)} 件のリストを生成しました {freshness_msg}")
 
     except Exception as e:
-        _job_state["error"] = str(e)
+        logger.error("リスト生成中にエラーが発生しました", exc_info=True)
+        with _job_lock:
+            _job_state["error"] = "リスト生成中にエラーが発生しました。設定を確認して再度お試しください。"
     finally:
-        _job_state["running"] = False
+        with _job_lock:
+            _job_state["running"] = False
 
 
 # ============================================================
@@ -545,6 +595,46 @@ def index():
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
+    global _last_generate_time
+
+    # --- Origin check (CSRF protection) ---
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+    if origin and not origin.startswith(request.host_url.rstrip("/")):
+        return jsonify({"error": "不正なリクエスト元です"}), 403
+    if not origin and referer and not referer.startswith(request.host_url):
+        return jsonify({"error": "不正なリクエスト元です"}), 403
+
+    # --- Rate limit: 1回/60秒 ---
+    import time
+    now = time.time()
+    if now - _last_generate_time < 60:
+        remaining = int(60 - (now - _last_generate_time))
+        return jsonify({"error": f"連続実行制限中です。あと{remaining}秒お待ちください。"}), 429
+
+    # --- Input validation ---
+    industry = request.args.get("industry", "all").strip()
+    if industry != "all" and industry not in INDUSTRY_TARGETS:
+        return jsonify({"error": "無効な業界が指定されました"}), 400
+
+    try:
+        limit = int(request.args.get("limit", 1000))
+        dr_min = int(request.args.get("dr_min", 10))
+        dr_max = int(request.args.get("dr_max", 70))
+    except (ValueError, TypeError):
+        return jsonify({"error": "数値パラメータが不正です"}), 400
+
+    if not (10 <= limit <= 5000):
+        return jsonify({"error": "件数は10〜5000の範囲で指定してください"}), 400
+    if not (0 <= dr_min <= 100 and 0 <= dr_max <= 100):
+        return jsonify({"error": "DR範囲は0〜100で指定してください"}), 400
+    if dr_min > dr_max:
+        return jsonify({"error": "DR下限は上限以下にしてください"}), 400
+
+    exclude_history = request.args.get("exclude_history", "true") == "true"
+    skip_persons = request.args.get("skip_persons", "false") == "true"
+    discovery_seeds = 30
+
     with _job_lock:
         if _job_state["running"]:
             return jsonify({"error": "既にリスト生成が実行中です。完了までお待ちください。"})
@@ -555,14 +645,7 @@ def api_generate():
         _job_state["error"] = ""
         _job_state["result_path"] = ""
 
-    from flask import request
-    industry = request.args.get("industry", "all")
-    limit = int(request.args.get("limit", 1000))
-    dr_min = int(request.args.get("dr_min", 10))
-    dr_max = int(request.args.get("dr_max", 70))
-    exclude_history = request.args.get("exclude_history", "true") == "true"
-    skip_persons = request.args.get("skip_persons", "false") == "true"
-    discovery_seeds = 30
+    _last_generate_time = now
 
     thread = threading.Thread(
         target=_run_list_generation,
@@ -576,7 +659,8 @@ def api_generate():
 
 @app.route("/api/progress")
 def api_progress():
-    return jsonify(_job_state)
+    with _job_lock:
+        return jsonify(_job_state.copy())
 
 
 @app.route("/api/stats")
@@ -630,40 +714,34 @@ def api_files():
 @app.route("/download/file/<date>/<filename>")
 def download_file(date, filename):
     """個別ファイルダウンロード."""
-    # Prevent path traversal
-    safe_date = os.path.basename(date)
-    safe_name = os.path.basename(filename)
-    file_path = os.path.join(OUTPUT_BASE, safe_date, safe_name)
-
-    if not os.path.exists(file_path):
+    resolved = _safe_resolve(date, filename)
+    if resolved is None or not resolved.is_file():
         return "File not found", 404
 
-    return send_file(file_path, as_attachment=True)
+    return send_file(str(resolved), as_attachment=True)
 
 
 @app.route("/download/zip/<date>")
 def download_zip(date):
     """日付フォルダのファイルを一括ZIPダウンロード."""
-    safe_date = os.path.basename(date)
-    dir_path = os.path.join(OUTPUT_BASE, safe_date)
-
-    if not os.path.isdir(dir_path):
+    resolved = _safe_resolve(date)
+    if resolved is None or not resolved.is_dir():
         return "Date folder not found", 404
 
     # Create ZIP in memory
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in os.listdir(dir_path):
-            fpath = os.path.join(dir_path, fname)
-            if os.path.isfile(fpath):
-                zf.write(fpath, fname)
+        for fname in os.listdir(str(resolved)):
+            fpath = resolved / fname
+            if fpath.is_file():
+                zf.write(str(fpath), fname)
 
     buffer.seek(0)
     return send_file(
         buffer,
         mimetype="application/zip",
         as_attachment=True,
-        download_name=f"nwlist_{safe_date}.zip",
+        download_name=f"nwlist_{date}.zip",
     )
 
 
@@ -673,4 +751,5 @@ if __name__ == "__main__":
     print("NWlist Web UI")
     print("http://localhost:5000")
     print("=" * 50)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # 127.0.0.1にバインド（外部からのアクセスを遮断）
+    app.run(host="127.0.0.1", port=5000, debug=False)

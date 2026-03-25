@@ -11,9 +11,12 @@
 - 情報ソースURL
 """
 
+import ipaddress
 import re
+import socket
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -84,9 +87,35 @@ def _get_session() -> requests.Session:
     return _thread_local.session
 
 
+_BLOCKED_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254"}
+
+
+def _is_safe_url(url: str) -> bool:
+    """URLが内部ネットワーク/メタデータエンドポイントでないか検証."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        if hostname in _BLOCKED_HOSTS:
+            return False
+        for info in socket.getaddrinfo(hostname, None):
+            addr = info[4][0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False
+    except (socket.gaierror, ValueError):
+        return False
+    return True
+
+
 def _fetch_page(url: str, timeout: int = 10) -> BeautifulSoup | None:
+    if not _is_safe_url(url):
+        return None
     try:
         resp = _get_session().get(url, timeout=timeout, allow_redirects=True)
+        if resp.url != url and not _is_safe_url(resp.url):
+            return None
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding
         return BeautifulSoup(resp.text, "html.parser")

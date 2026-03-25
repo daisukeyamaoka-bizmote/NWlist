@@ -7,9 +7,12 @@ Webスクレイピングにより以下を取得:
 - 担当者名（運営者情報ページ等）
 """
 
+import ipaddress
 import re
+import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,8 +50,34 @@ CONTACT_PAGE_PATHS = [
 ]
 
 
+_BLOCKED_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254"}
+
+
+def _is_safe_url(url: str) -> bool:
+    """URLが内部ネットワーク/メタデータエンドポイントでないか検証."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        if hostname in _BLOCKED_HOSTS:
+            return False
+        # DNS解決して内部IPでないか確認
+        for info in socket.getaddrinfo(hostname, None):
+            addr = info[4][0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False
+    except (socket.gaierror, ValueError):
+        return False
+    return True
+
+
 def _fetch_page(url: str, timeout: int = 10) -> BeautifulSoup | None:
-    """Fetch a page and return BeautifulSoup object."""
+    """Fetch a page and return BeautifulSoup object (SSRF保護付き)."""
+    if not _is_safe_url(url):
+        return None
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,6 +87,9 @@ def _fetch_page(url: str, timeout: int = 10) -> BeautifulSoup | None:
     }
     try:
         resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        # リダイレクト先もSSRF検証
+        if resp.url != url and not _is_safe_url(resp.url):
+            return None
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding
         return BeautifulSoup(resp.text, "html.parser")
